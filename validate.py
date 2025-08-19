@@ -4,16 +4,15 @@ import json
 import sys
 import argparse
 import io
-from datetime import datetime, timedelta
+from datetime import datetime
 import base64
 import contextlib
 import re
 
 # -------------------------------
-# Helpers: dual-output "tee"
+# Tee stdout
 # -------------------------------
 class TeeStdout:
-    """Write prints to console and to a buffer simultaneously."""
     def __init__(self, *streams):
         self.streams = streams
 
@@ -27,7 +26,7 @@ class TeeStdout:
             s.flush()
 
 # -------------------------------
-# Core Class
+# JSM/Jira Validator
 # -------------------------------
 class JSMToJIRAValidator:
     def __init__(self, jira_url, username, api_token, xray_client_id, xray_client_secret):
@@ -41,265 +40,97 @@ class JSMToJIRAValidator:
         self.xray_client_id = xray_client_id
         self.xray_client_secret = xray_client_secret
 
-    def get_latest_jsm_request(self, jsm_project_key, hours_back=1):
-        start_date = (datetime.now() - timedelta(hours=hours_back)).strftime('%Y-%m-%d %H:%M')
-        jql = (
-            f'project = "{jsm_project_key}" AND summary ~ "create version request" '
-            f'AND created >= "{start_date}" ORDER BY created DESC'
-        )
-        try:
-            r = requests.post(
-                f"{self.jira_url}/rest/api/3/search",
-                headers=self.headers,
-                json={"jql": jql, "maxResults": 1, "fields": ["key", "summary", "reporter"]}
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data['issues'][0] if data['issues'] else None
-        except Exception as e:
-            print(f"❌ Error fetching latest JSM request: {e}")
-            return None
+    def get_latest_jsm_request(self, jsm_project_key):
+        jql = f'project = {jsm_project_key} AND summary ~ "create version" ORDER BY created DESC'
+        r = requests.get(f"{self.jira_url}/rest/api/3/search",
+                         headers=self.headers,
+                         params={"jql": jql, "maxResults": 1, "fields": "key,summary,reporter"})
+        r.raise_for_status()
+        data = r.json()
+        return data['issues'][0] if data['issues'] else None
 
-    def is_valid_version_request(self, summary):
-        pattern = r'^\s*create\s+version\s+request\s*-\s*(\d+\.\d+\.\d+)\s*$'
-        m = re.match(pattern, summary, flags=re.IGNORECASE)
-        if m:
-            return True, m.group(1)
-        return False, None
-
-    def find_corresponding_jira_issue(self, target_project_key, summary):
-        version = summary.split('-')[-1].strip()
-        jql = (
-            f'project = "{target_project_key}" AND summary ~ "{version}" '
-            f'AND status = "BACKLOG" ORDER BY created DESC'
-        )
-        try:
-            r = requests.post(
-                f"{self.jira_url}/rest/api/3/search",
-                headers=self.headers,
-                json={"jql": jql, "maxResults": 5, "fields": ["key", "status", "summary"]}
-            )
-            r.raise_for_status()
-            data = r.json()
-            for issue in data.get('issues', []):
-                if version and version in issue['fields']['summary']:
-                    return issue
-            return None
-        except Exception as e:
-            print(f"❌ Error searching for JIRA issue: {e}")
-            return None
-
-    def find_issue_by_exact_summary(self, target_project_key, summary):
-        phrase = summary.replace('"', r'\"')
-        jql = f'project = "{target_project_key}" AND summary ~ "\\"{phrase}\\"" ORDER BY created DESC'
-        try:
-            r = requests.post(
-                f"{self.jira_url}/rest/api/3/search",
-                headers=self.headers,
-                json={"jql": jql, "maxResults": 5, "fields": ["key", "status", "summary"]}
-            )
-            r.raise_for_status()
-            data = r.json()
-            for issue in data.get('issues', []):
-                if issue['fields']['summary'].strip().lower() == summary.strip().lower():
-                    return issue
-            return None
-        except Exception as e:
-            print(f"❌ Error searching for exact summary issue: {e}")
-            return None
-
-    def delete_issue(self, issue_key):
-        try:
-            url = f"{self.jira_url}/rest/api/3/issue/{issue_key}"
-            r = requests.delete(url, headers=self.headers)
-            r.raise_for_status()
-            print(f"🗑️ Deleted Jira issue {issue_key}")
-            return True
-        except Exception as e:
-            print(f"❌ Failed to delete issue {issue_key}: {e}")
-            return False
-
-    def create_bug(self, project_key, summary, description_adf):
-        try:
-            url = f"{self.jira_url}/rest/api/3/issue"
-            payload = {
-                "fields": {
-                    "project": {"key": project_key},
-                    "summary": summary,
-                    "issuetype": {"name": "Bug"},
-                    "description": description_adf,
-                    "labels": ["invalid-service-request", "auto-created"]
-                }
+    def create_bug_issue(self, project_key, summary, description):
+        payload = {
+            "fields": {
+                "project": {"key": project_key},
+                "summary": summary,
+                "description": description,
+                "issuetype": {"name": "Bug"},
+                "priority": {"name": "Medium"}
             }
-            r = requests.post(url, headers=self.headers, json=payload)
-            r.raise_for_status()
-            key = r.json().get("key")
-            print(f"🐛 Created Bug {key}")
-            return key
-        except Exception as e:
-            print(f"❌ Failed to create Bug: {e}")
-            return None
-
-    def link_issues(self, inward_key, outward_key, link_type="Relates"):
-        try:
-            url = f"{self.jira_url}/rest/api/3/issueLink"
-            payload = {
-                "type": {"name": link_type},
-                "inwardIssue": {"key": inward_key},
-                "outwardIssue": {"key": outward_key}
-            }
-            r = requests.post(url, headers=self.headers, json=payload)
-            r.raise_for_status()
-            print(f"🔗 Linked {inward_key} ⇄ {outward_key} ({link_type})")
-            return True
-        except Exception as e:
-            print(f"⚠️ Link attempt {inward_key} ⇄ {outward_key} failed/duplicate: {e}")
-            return False
+        }
+        r = requests.post(f"{self.jira_url}/rest/api/2/issue", headers=self.headers, json=payload)
+        r.raise_for_status()
+        return r.json()["key"]
 
     def add_comment_adf(self, issue_key, text):
-        try:
-            url = f"{self.jira_url}/rest/api/3/issue/{issue_key}/comment"
-            payload = {
-                "body": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [{
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": text}]
-                    }]
-                }
-            }
-            r = requests.post(url, headers=self.headers, json=payload)
-            r.raise_for_status()
-            print(f"💬 Comment added to {issue_key}")
-            return True
-        except Exception as e:
-            print(f"❌ Failed to add comment to {issue_key}: {e}")
-            return False
-
-    def append_logs_to_description(self, jsm_key, logs):
-        try:
-            issue_url = f"{self.jira_url}/rest/api/3/issue/{jsm_key}"
-            resp = requests.get(issue_url, headers=self.headers, params={"fields": "description"})
-            resp.raise_for_status()
-            desc_adf = resp.json()["fields"]["description"]
-            existing_text = self._adf_to_text(desc_adf) if desc_adf else ""
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            new_adf = {"type": "doc", "version": 1, "content": []}
-
-            if existing_text.strip():
-                new_adf["content"].append({
+        payload = {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [{
                     "type": "paragraph",
-                    "content": [{"type": "text", "text": existing_text}]
-                })
-                new_adf["content"].append({"type": "rule"})
-
-            new_adf["content"].append({
-                "type": "paragraph",
-                "content": [{"type": "text", "text": f"---- Console Output ({timestamp}) ----"}]
-            })
-            new_adf["content"].append({
-                "type": "codeBlock",
-                "attrs": {"language": "text"},
-                "content": [{"type": "text", "text": logs}]
-            })
-
-            payload = {"fields": {"description": new_adf}}
-            put_resp = requests.put(issue_url, headers=self.headers, json=payload)
-            put_resp.raise_for_status()
-            print(f"📝 Appended logs to JSM request {jsm_key} description")
-        except Exception as e:
-            print(f"❌ Failed to append logs to description: {e}")
-
-    def _adf_to_text(self, adf):
-        if not adf or "content" not in adf:
-            return ""
-        out = []
-        def walk(node):
-            if isinstance(node, dict):
-                if node.get("type") == "text":
-                    out.append(node.get("text", ""))
-                for c in node.get("content", []):
-                    walk(c)
-            elif isinstance(node, list):
-                for c in node:
-                    walk(c)
-        walk(adf)
-        return "\n".join(out).strip()
-
-    def is_user_admin(self, account_id):
-        try:
-            url = f"{self.jira_url}/rest/api/3/user/groups"
-            r = requests.get(url, headers=self.headers, params={"accountId": account_id})
-            r.raise_for_status()
-            groups = [g['name'].lower() for g in r.json()]
-            return any("admin" in g for g in groups)
-        except Exception as e:
-            print(f"❌ Failed to check admin status: {e}")
-            return False
+                    "content": [{"type": "text", "text": text}]
+                }]
+            }
+        }
+        requests.post(f"{self.jira_url}/rest/api/3/issue/{issue_key}/comment",
+                      headers=self.headers, json=payload).raise_for_status()
 
     def get_xray_token(self):
-        try:
-            resp = requests.post(
-                "https://xray.cloud.getxray.app/api/v2/authenticate",
-                json={"client_id": self.xray_client_id, "client_secret": self.xray_client_secret}
-            )
-            resp.raise_for_status()
-            return resp.text.strip('"')
-        except Exception as e:
-            print(f"❌ Failed to authenticate with Xray: {e}")
-            return None
+        resp = requests.post(
+            "https://xray.cloud.getxray.app/api/v2/authenticate",
+            json={"client_id": self.xray_client_id, "client_secret": self.xray_client_secret}
+        )
+        resp.raise_for_status()
+        return resp.text.strip('"')
 
-    def submit_test_result(self, test_execution_key, test_key, status, comment=""):
+    def submit_test_result(self, exe_key, test_key, status, comment=""):
         token = self.get_xray_token()
-        if not token:
-            return None
-        url = "https://xray.cloud.getxray.app/api/v2/import/execution"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
         payload = {
-            "testExecutionKey": test_execution_key,
-            "tests": [
-                {
-                    "testKey": test_key,
-                    "status": "PASSED" if status.upper() == "PASS" else "FAILED",
-                    "comment": comment
-                }
-            ]
+            "testExecutionKey": exe_key,
+            "tests": [{
+                "testKey": test_key,
+                "status": "PASSED" if status.upper() == "PASS" else "FAILED",
+                "comment": comment
+            }]
         }
-        try:
-            resp = requests.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            print(f"✅ Xray execution updated - {test_key}: {status}")
-            return {test_key: status}
-        except Exception as e:
-            print(f"❌ Error submitting Xray test result for {test_key}: {e}")
-            return None
+        r = requests.post(
+            "https://xray.cloud.getxray.app/api/v2/import/execution",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json=payload
+        )
+        r.raise_for_status()
+        return {test_key: status}
 
-    def link_jsm_with_test_execution(self, jsm_key, test_execution_key):
-        return self.link_issues(jsm_key, test_execution_key, link_type="Relates")
+    def link_issues(self, left_key, right_key):
+        payload = {
+            "type": {"name": "Relates"},
+            "inwardIssue": {"key": left_key},
+            "outwardIssue": {"key": right_key}
+        }
+        requests.post(f"{self.jira_url}/rest/api/3/issueLink",
+                      headers=self.headers, json=payload).raise_for_status()
 
 # -------------------------------
-# Main
+# main
 # -------------------------------
 def main():
     JIRA_URL = "https://deva2cprime.atlassian.net"
     USERNAME = "2019yoga@gmail.com"
-    API_TOKEN = "ATATT3xFfGF0pEF0PEtsE4Q7LuIKk8dxd3MUfm82-lnc5ifybRAWcXTAH1AwgdZHyXe8dgQUf-BIj4uqW5BSCXPZWBTv6KRjQ3_1QegVWYuT3izKSAsBEBUE_Ww3CouG2CkiXsrOc2Be3mbsVhsmsCyBqJZuPfpi8yxvPryX6SNAakCvnBKfjko=EA4B5AF8"
+    API_TOKEN = "ATATT3xFfGF0eXg6yKrJCGiCgYQUtHcN-APf99q1Eoj6zutyZKEQFSc6ibVFy2DS7gsHcARtFX6YgCxOhSWjfnnmvgpP6zSBH7IZpRYbtxb2WeqPoit2eQoHPb6iixXZg7gWogU90iG1LO0YxYjrdr1WXHYr6oKnKRWR0jRL0vnAO74SpjNFBCY=028D9999"
     XRAY_CLIENT_ID = "391845606EA543CA964F15D73B576E62"
     XRAY_CLIENT_SECRET = "4d6365ecaf9bee3bfc47e9ca2348ac46bf359bd71167bb846e903f2fae832664"
+
     JSM_PROJECT_KEY = "NVP"
     TARGET_PROJECT_KEY = "ITNPP"
 
-    parser = argparse.ArgumentParser(description="Validate JSM request -> Jira + Xray and annotate JSM")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--test-execution-key", required=True)
-    parser.add_argument("--test-case-key", required=True)
-    parser.add_argument("--test-case-2-key")
-    parser.add_argument("--test-case-3-key", required=True)  # Release date validation (e.g. ITNPP-51)
-    parser.add_argument("--test-case-4-key")
-    parser.add_argument("--hours-back", type=int, default=1)
+    parser.add_argument("--test-case-3-key", required=True)
+    parser.add_argument("--test-case-4-key", required=True)
+    parser.add_argument("--test-case-5-key", required=True)
     args = parser.parse_args()
 
     validator = JSMToJIRAValidator(JIRA_URL, USERNAME, API_TOKEN, XRAY_CLIENT_ID, XRAY_CLIENT_SECRET)
@@ -309,172 +140,164 @@ def main():
     with contextlib.redirect_stdout(tee):
         print("=" * 60)
         print("🔍 Checking for LATEST JSM service request...")
-        latest_jsm = validator.get_latest_jsm_request(JSM_PROJECT_KEY, args.hours_back)
-        if not latest_jsm:
+
+        latest = validator.get_latest_jsm_request(JSM_PROJECT_KEY)
+        if not latest:
             print("❌ No recent JSM requests found")
             return
 
-        jsm_key = latest_jsm["key"]
-        jsm_summary = latest_jsm["fields"]["summary"]
-        reporter_account_id = latest_jsm["fields"]["reporter"]["accountId"]
-        print(f"📋 Found JSM request: {jsm_key} - '{jsm_summary}' by {latest_jsm['fields']['reporter']['displayName']}")
+        jsm_key = latest["key"]
+        jsm_summary = latest["fields"]["summary"]
+        reporter_name = latest["fields"]["reporter"]["displayName"]
+        print(f"📋 Found JSM request: {jsm_key} — '{jsm_summary}'")
+        print(f"👤 Reporter: {reporter_name}")
 
-        is_valid, version = validator.is_valid_version_request(jsm_summary)
-        if is_valid:
-            print(f"✅ Valid version request detected: {version}")
-        else:
-            print("❌ Invalid request: no version provided after hyphen")
+        # Extract version
+        version_match = re.search(r'(\d+\.\d+\.\d+)', jsm_summary)
+        version = version_match.group(1) if version_match else None
 
-        print("\n🔎 Validating JIRA backlog issue...")
-        test1_status = "FAIL"
-        test1_message = "No matching backlog issue found"
-        if is_valid:
-            jira_issue = validator.find_corresponding_jira_issue(TARGET_PROJECT_KEY, jsm_summary)
-            if jira_issue:
-                test1_status = "PASS"
-                test1_message = f"Found matching JIRA issue: {jira_issue['key']}"
-                print(f"✅ {test1_message}")
+        # ---- Test Case 3 (release date validation) ----
+        test3_status = "FAIL"
+        test3_message = "No version number found in summary"
+        names, fields = {}, {}
+
+        if version:
+            print(f"📦 Version detected: {version}")
+
+            resp = requests.get(f"{JIRA_URL}/rest/api/3/issue/{jsm_key}",
+                                headers=validator.headers, params={"expand": "names"})
+            resp.raise_for_status()
+            payload = resp.json()
+            fields, names = payload["fields"], payload.get("names", {})
+
+            release_field = None
+            for fid, label in names.items():
+                if label.lower() == "release date":
+                    release_field = fid
+                    break
+
+            release_date_str = fields.get(release_field)
+            today = datetime.today().date()
+
+            if not release_date_str:
+                test3_status, test3_message = "PASS", "No release date provided - validation passed"
+                print("✅ No release date provided")
             else:
-                print(f"❌ {test1_message}")
-        else:
-            test1_status = "FAIL"
-            test1_message = "Invalid JSM request (missing version); backlog check failed"
-            print(f"❌ {test1_message}")
-
-        test2_status = None
-        test2_message = None
-        if args.test_case_2_key:
-            if not is_valid:
-                print("\n🧹 Handling invalid request flow...")
-                wrong_issue = validator.find_issue_by_exact_summary(TARGET_PROJECT_KEY, jsm_summary)
-                if wrong_issue:
-                    validator.delete_issue(wrong_issue["key"])
-                bug_summary = f"Invalid service request (no version): {jsm_key}"
-                bug_desc = {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [{
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": f"Customer raised '{jsm_summary}' without a version."}]
-                    }]
-                }
-                bug_key = validator.create_bug(TARGET_PROJECT_KEY, bug_summary, bug_desc)
-                if bug_key:
-                    validator.link_issues(bug_key, jsm_key, link_type="Relates")
-                validator.add_comment_adf(jsm_key, "Invalid request format.")
-                test2_status = "FAIL"
-                test2_message = "Missing version"
-            else:
-                test2_status = "PASS"
-                test2_message = f"Valid version: {version}"
-
-        # ---------------------------
-        # Test Case 3: Release date >= 1 week?
-        # ---------------------------
-        test3_status = None
-        test3_message = None
-        if args.test_case_3_key and is_valid:
-            try:
-                data_resp = requests.get(
-                    f"{validator.jira_url}/rest/api/3/issue/{jsm_key}",
-                    headers=validator.headers,
-                    params={"expand": "names"}
-                )
-                data_resp.raise_for_status()
-                issue_data = data_resp.json()
-                fields = issue_data["fields"]
-                names = issue_data.get("names", {})
-
-                # find "Release Date" field id dynamically
-                release_field = None
-                for fid, label in names.items():
-                    if label.lower() == "release date":
-                        release_field = fid
-                        break
-
-                release_date_str = fields.get(release_field) if release_field else None
-                today = datetime.today().date()
-
-                if not release_date_str:
-                    test3_status = "PASS"
-                    test3_message = "No release date provided"
+                print(f"📅 Release date found: {release_date_str}")
+                rd = datetime.strptime(release_date_str.split('T')[0], "%Y-%m-%d").date()
+                days_until_release = (rd - today).days
+                if days_until_release < 7:
+                    test3_message = f"Release date is too early ({days_until_release} days away)"
+                    validator.add_comment_adf(jsm_key, "❌ Release version request is too early (< 7 days).")
+                    print(f"❌ {test3_message}")
                 else:
-                    # Parse ISO or human format
-                    if isinstance(release_date_str, str) and 'T' in release_date_str:
-                        release_date = datetime.fromisoformat(release_date_str.split('+')[0]).date()
-                    else:
-                        try:
-                            release_date = datetime.strptime(release_date_str, "%b %d, %Y, %I:%M %p").date()
-                        except Exception:
-                            release_date = datetime.strptime(release_date_str, "%Y-%m-%d").date()
+                    test3_status, test3_message = "PASS", f"Release date is valid ({days_until_release} days away)"
+                    print(f"✅ {test3_message}")
 
-                    if (release_date - today).days < 7:
-                        test3_status = "FAIL"
-                        test3_message = "Release version request is too early (less than 1 week)"
-                        bug_summary = f"User requested version too early: {version} (release {release_date_str})"
-                        bug_desc = {
-                            "type": "doc",
-                            "version": 1,
-                            "content": [{
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": "User requested version too early."}]
-                            }]
-                        }
-                        # bug_key = validator.create_bug(TARGET_PROJECT_KEY, bug_summary, bug_desc)
-                        # if bug_key:
-                        #     validator.link_issues(bug_key, jsm_key, link_type="Relates")
-                        validator.add_comment_adf(jsm_key, "User requested version too early.")
+        # ---- Test Case 4 (reporter check) ----
+        if reporter_name == "V.Devendra Reddy":
+            test4_status, test4_message = "PASS", "Reporter is allowed (you)"
+            print("✅ Request was raised by you")
+        else:
+            test4_status, test4_message = "FAIL", "Request was raised by someone else"
+            print("❌ Request was NOT raised by you")
+
+        # ---- Test Case 5 (env + version logic) ----
+        test5_status, test5_message = "FAIL", "❌ Validation not performed"
+        test_env = None
+
+        for fid, label in names.items():
+            if label.lower() == "test-env":
+                test_env = fields.get(fid)
+                break
+
+        # ✅ normalize TEST-ENV (dict or string)
+        if isinstance(test_env, dict) and "value" in test_env:
+            test_env = test_env["value"]
+        elif isinstance(test_env, list) and test_env and isinstance(test_env[0], dict):
+            test_env = test_env[0].get("value")
+
+        if version and test_env:
+            try:
+                parts = [int(p) for p in version.split(".")]
+                major = parts[0]
+
+                if test_env == "UAT":
+                    if major < 10:
+                        test5_status, test5_message = "PASS", f"✅ UAT allowed for version {version}"
                     else:
-                        test3_status = "PASS"
-                        test3_message = "Release version request is valid (>= 1 week)"
+                        test5_message = f"❌ UAT not allowed for version {version} (must be < 10)"
+
+                elif test_env == "PROD":
+                    if major > 10 or (major == 10 and len(parts) > 1 and parts[1] > 0):
+                        test5_status, test5_message = "PASS", f"✅ PROD allowed for version {version}"
+                    else:
+                        test5_message = f"❌ PROD requires version > 10, got {version}"
+
+                elif test_env == "SIT":
+                    test5_status, test5_message = "PASS", f"✅ SIT accepts any version ({version})"
+
+                else:
+                    test5_message = f"❌ Unknown TEST-ENV: {test_env}"
 
             except Exception as e:
-                print(f"❌ Error checking release date: {e}")
-                test3_status = "FAIL"
-                test3_message = "Error checking release date"
+                test5_message = f"❌ Version parsing failed: {e}"
 
-        # ---------------------------
-        # Test Case 4: Admin check
-        # ---------------------------
-        test4_status = None
-        test4_message = None
-        if args.test_case_4_key:
-            print("\n👤 Checking if reporter is admin...")
-            if validator.is_user_admin(reporter_account_id):
-                test4_status = "PASS"
-                test4_message = "Reporter is an admin user"
-                print(f"✅ {test4_message}")
-            else:
-                test4_status = "FAIL"
-                test4_message = "Reporter is NOT an admin user"
-                print(f"❌ {test4_message}")
+        else:
+            test5_message = "❌ Missing version or TEST-ENV field"
 
-        print("\n🔗 Linking JSM to Test Execution...")
-        validator.link_jsm_with_test_execution(jsm_key, args.test_execution_key)
+        print(test5_message)
 
-        print("\n🔄 Updating X-ray test execution...")
-        execution_statuses = {}
-        res1 = validator.submit_test_result(args.test_execution_key, args.test_case_key, test1_status, test1_message)
-        if res1: execution_statuses.update(res1)
-        if args.test_case_2_key:
-            res2 = validator.submit_test_result(args.test_execution_key, args.test_case_2_key, test2_status, test2_message)
-            if res2: execution_statuses.update(res2)
-        res3 = validator.submit_test_result(args.test_execution_key, args.test_case_3_key, test3_status, test3_message)
-        if res3: execution_statuses.update(res3)
-        if args.test_case_4_key:
-            res4 = validator.submit_test_result(args.test_execution_key, args.test_case_4_key, test4_status, test4_message)
-            if res4: execution_statuses.update(res4)
+        # Collect failures
+        failed_tests = []
+        if test3_status == "FAIL":
+            failed_tests.append(f"Release Date Check: {test3_message}")
+        if test4_status == "FAIL":
+            failed_tests.append(f"Reporter Check: {test4_message}")
+        if test5_status == "FAIL":
+            failed_tests.append(f"Env+Version Check: {test5_message}")
+            validator.add_comment_adf(jsm_key, test5_message)
 
-        print("\n" + "=" * 60)
-        print(f"🏁 Validation complete for {jsm_key}")
+        bug_key = None
+        if failed_tests:
+            print("🐛 Creating bug for failed validations...")
+            bug_summary = f"Validation failures for JSM request {jsm_key}"
+            bug_description = (f"JSM Request: {jsm_key}  \nSummary: {jsm_summary}  \n\nFailed Validations:\n"
+                               + "\n".join([f"- {test}" for test in failed_tests]))
+            bug_key = validator.create_bug_issue(TARGET_PROJECT_KEY, bug_summary, bug_description)
+            print(f"🐛 Created bug: {bug_key}")
+            validator.link_issues(jsm_key, bug_key)
+            validator.link_issues(bug_key, args.test_execution_key)
+
+        print("🔗 Linking JSM request to Test Execution...")
+        validator.link_issues(jsm_key, args.test_execution_key)
+
+        print("🔄 Updating X-ray...")
+        results = {}
+        results.update(
+            validator.submit_test_result(args.test_execution_key, args.test_case_3_key, test3_status, test3_message)
+        )
+        results.update(
+            validator.submit_test_result(args.test_execution_key, args.test_case_4_key, test4_status, test4_message)
+        )
+        results.update(
+            validator.submit_test_result(args.test_execution_key, args.test_case_5_key, test5_status, test5_message)
+        )
+
         print("=" * 60)
+        print(f"🏁 Validation complete for {jsm_key}")
+        if bug_key:
+            print(f"🐛 Bug created: {bug_key}")
 
+    # Add audit log and results as comments
     validator.add_comment_adf(jsm_key, log_buffer.getvalue())
-    if execution_statuses:
-        lines = ["📊 Test Execution Results:"]
-        for k, v in execution_statuses.items():
-            lines.append(f"- {k}: {v}")
-        validator.add_comment_adf(jsm_key, "\n".join(lines))
+    if results:
+        comment = ["📊 Test Execution Results:"]
+        for k, v in results.items():
+            comment.append(f"- {k}: {v}")
+        if bug_key:
+            comment.append(f"🐛 Bug created: {bug_key}")
+        validator.add_comment_adf(jsm_key, "\n".join(comment))
 
 
 if __name__ == "__main__":
