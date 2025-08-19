@@ -131,6 +131,7 @@ def main():
     parser.add_argument("--test-case-3-key", required=True)
     parser.add_argument("--test-case-4-key", required=True)
     parser.add_argument("--test-case-5-key", required=True)
+    parser.add_argument("--test-case-6-key", required=True)
     args = parser.parse_args()
 
     validator = JSMToJIRAValidator(JIRA_URL, USERNAME, API_TOKEN, XRAY_CLIENT_ID, XRAY_CLIENT_SECRET)
@@ -163,7 +164,6 @@ def main():
 
         if version:
             print(f"📦 Version detected: {version}")
-
             resp = requests.get(f"{JIRA_URL}/rest/api/3/issue/{jsm_key}",
                                 headers=validator.headers, params={"expand": "names"})
             resp.raise_for_status()
@@ -248,7 +248,46 @@ def main():
 
         print(test5_message)
 
-        # Collect failures
+        # ---- Test Case 6 (version comparison with existing issues) ----
+        test6_status, test6_message = "FAIL", "Test Case 6 not performed yet"
+        if version:
+            major_version = version.split(".")[0]
+            try:
+                jql_all_versions = f'project = {TARGET_PROJECT_KEY} AND summary ~ "{major_version}."'
+                r = requests.get(f"{JIRA_URL}/rest/api/3/search",
+                                 headers=validator.headers,
+                                 params={"jql": jql_all_versions, "fields": "summary", "maxResults": 100})
+                r.raise_for_status()
+                issues = r.json().get("issues", [])
+
+                higher_found = False
+                for issue in issues:
+                    summary = issue["fields"]["summary"]
+                    v_match = re.search(r'(\d+\.\d+\.\d+)', summary)
+                    if v_match:
+                        v_parts = [int(p) for p in v_match.group(1).split(".")]
+                        c_parts = [int(p) for p in version.split(".")]
+                        if v_parts > c_parts:
+                            higher_found = True
+                            break
+
+                if not higher_found:
+                    test6_status, test6_message = "PASS", f"✅ {version} is greater than all {major_version}.* versions"
+                    print(test6_message)
+                else:
+                    test6_status, test6_message = "FAIL", f"❌ {version} is NOT greater than all {major_version}.* versions"
+                    print(test6_message)
+                    bug_summary = f"Validation failures for Test Case 6 - {jsm_key}"
+                    bug_description = test6_message
+                    bug_key_tc6 = validator.create_bug_issue(TARGET_PROJECT_KEY, bug_summary, bug_description)
+                    validator.link_issues(jsm_key, bug_key_tc6)
+                    validator.link_issues(bug_key_tc6, args.test_execution_key)
+
+            except Exception as e:
+                test6_status, test6_message = "FAIL", f"❌ Test Case 6 check failed: {e}"
+                print(test6_message)
+
+        # ---- Collect failures and create bugs if needed ----
         failed_tests = []
         if test3_status == "FAIL":
             failed_tests.append(f"Release Date Check: {test3_message}")
@@ -256,7 +295,6 @@ def main():
             failed_tests.append(f"Reporter Check: {test4_message}")
         if test5_status == "FAIL":
             failed_tests.append(f"Env+Version Check: {test5_message}")
-            validator.add_comment_adf(jsm_key, test5_message)
 
         bug_key = None
         if failed_tests:
@@ -269,36 +307,24 @@ def main():
             validator.link_issues(jsm_key, bug_key)
             validator.link_issues(bug_key, args.test_execution_key)
 
-        print("🔗 Linking JSM request to Test Execution...")
-        validator.link_issues(jsm_key, args.test_execution_key)
-
-        print("🔄 Updating X-ray...")
+        # ---- Submit Xray results ----
         results = {}
-        results.update(
-            validator.submit_test_result(args.test_execution_key, args.test_case_3_key, test3_status, test3_message)
-        )
-        results.update(
-            validator.submit_test_result(args.test_execution_key, args.test_case_4_key, test4_status, test4_message)
-        )
-        results.update(
-            validator.submit_test_result(args.test_execution_key, args.test_case_5_key, test5_status, test5_message)
-        )
+        results.update(validator.submit_test_result(args.test_execution_key, args.test_case_3_key, test3_status, test3_message))
+        results.update(validator.submit_test_result(args.test_execution_key, args.test_case_4_key, test4_status, test4_message))
+        results.update(validator.submit_test_result(args.test_execution_key, args.test_case_5_key, test5_status, test5_message))
+        results.update(validator.submit_test_result(args.test_execution_key, args.test_case_6_key, test6_status, test6_message))
+
+        validator.add_comment_adf(jsm_key, log_buffer.getvalue())
+        if results:
+            comment = ["📊 Test Execution Results:"]
+            for k, v in results.items():
+                comment.append(f"- {k}: {v}")
+            if bug_key:
+                comment.append(f"🐛 Bug created: {bug_key}")
+            validator.add_comment_adf(jsm_key, "\n".join(comment))
 
         print("=" * 60)
         print(f"🏁 Validation complete for {jsm_key}")
-        if bug_key:
-            print(f"🐛 Bug created: {bug_key}")
-
-    # Add audit log and results as comments
-    validator.add_comment_adf(jsm_key, log_buffer.getvalue())
-    if results:
-        comment = ["📊 Test Execution Results:"]
-        for k, v in results.items():
-            comment.append(f"- {k}: {v}")
-        if bug_key:
-            comment.append(f"🐛 Bug created: {bug_key}")
-        validator.add_comment_adf(jsm_key, "\n".join(comment))
-
 
 if __name__ == "__main__":
     main()
