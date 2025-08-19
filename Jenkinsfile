@@ -10,16 +10,14 @@ pipeline {
 
         stage('Run Validation') {
             steps {
-                // If your Jenkins agent is Linux/macOS:
                 sh '''
-                    python validate.py \
+                    # Run Python script unbuffered so all prints appear in console
+                    python3 -u $WORKSPACE/validate.py \
                       --test-execution-key ITNPP-33 \
                       --test-case-3-key ITNPP-51 \
                       --test-case-4-key ITNPP-70 \
-                      --test-case-5-key ITNPP-130 \
+                      --test-case-5-key ITNPP-130
                 '''
-                // If using Windows agent, use the following instead:
-                // bat "python validate.py --test-execution-key ITNPP-33 --test-case-key ITNPP-32 --test-case-2-key ITNPP-40 --test-case-4-key ITNPP-70 --test-case-3-key ITNPP-51"
             }
         }
     }
@@ -36,4 +34,3 @@ pipeline {
         }
     }
 }
-
