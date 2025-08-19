@@ -113,6 +113,34 @@ class JSMToJIRAValidator:
         requests.post(f"{self.jira_url}/rest/api/3/issueLink",
                       headers=self.headers, json=payload).raise_for_status()
 
+    # -------------------------------
+    # Transition issue to "Resolve this issue"
+    # -------------------------------
+    def transition_issue_to_resolve_this_issue(self, issue_key):
+        r = requests.get(f"{self.jira_url}/rest/api/3/issue/{issue_key}/transitions",
+                         headers=self.headers)
+        r.raise_for_status()
+        transitions = r.json().get("transitions", [])
+
+        # Find transition with name "Resolve this issue"
+        transition_id = None
+        for t in transitions:
+            if t.get("name", "").strip() == "Resolve this issue":
+                transition_id = t["id"]
+                break
+
+        if not transition_id:
+            print(f"⚠️ Transition 'Resolve this issue' not found for {issue_key}. Available transitions:")
+            for t in transitions:
+                print(f"- {t['name']} (to status {t['to']['name']})")
+            return False
+
+        payload = {"transition": {"id": transition_id}}
+        r = requests.post(f"{self.jira_url}/rest/api/3/issue/{issue_key}/transitions",
+                          headers=self.headers, json=payload)
+        r.raise_for_status()
+        print(f"✅ JSM request {issue_key} transitioned using 'Resolve this issue'")
+        return True
 
 # -------------------------------
 # main
@@ -324,6 +352,10 @@ def main():
             if bug_key:
                 comment.append(f"🐛 Bug created: {bug_key}")
             validator.add_comment_adf(jsm_key, "\n".join(comment))
+
+        # ---- Transition JSM request if all tests passed ----
+        if all(status.upper() == "PASS" for status in [test3_status, test4_status, test5_status, test6_status]):
+            validator.transition_issue_to_resolve_this_issue(jsm_key)
 
         print("=" * 60)
         print(f"🏁 Validation complete for {jsm_key}")
