@@ -12,7 +12,7 @@ pipeline {
             steps {
                 // If your Jenkins agent is Linux/macOS:
                 sh '''
-                    python3 validate.py \
+                    python validate.py \
                       --test-execution-key ITNPP-33 \
                       --test-case-3-key ITNPP-51 \
                       --test-case-4-key ITNPP-70 \
@@ -36,3 +36,4 @@ pipeline {
         }
     }
 }
+
