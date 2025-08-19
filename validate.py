@@ -113,6 +113,7 @@ class JSMToJIRAValidator:
         requests.post(f"{self.jira_url}/rest/api/3/issueLink",
                       headers=self.headers, json=payload).raise_for_status()
 
+
 # -------------------------------
 # main
 # -------------------------------
@@ -211,7 +212,6 @@ def main():
                 test_env = fields.get(fid)
                 break
 
-        # ✅ normalize TEST-ENV (dict or string)
         if isinstance(test_env, dict) and "value" in test_env:
             test_env = test_env["value"]
         elif isinstance(test_env, list) and test_env and isinstance(test_env[0], dict):
@@ -281,7 +281,6 @@ def main():
                     bug_description = test6_message
                     bug_key_tc6 = validator.create_bug_issue(TARGET_PROJECT_KEY, bug_summary, bug_description)
                     validator.link_issues(jsm_key, bug_key_tc6)
-                    validator.link_issues(bug_key_tc6, args.test_execution_key)
 
             except Exception as e:
                 test6_status, test6_message = "FAIL", f"❌ Test Case 6 check failed: {e}"
@@ -305,7 +304,9 @@ def main():
             bug_key = validator.create_bug_issue(TARGET_PROJECT_KEY, bug_summary, bug_description)
             print(f"🐛 Created bug: {bug_key}")
             validator.link_issues(jsm_key, bug_key)
-            validator.link_issues(bug_key, args.test_execution_key)
+
+        # ---- Link JSM request to Test Execution ----
+        validator.link_issues(jsm_key, args.test_execution_key)
 
         # ---- Submit Xray results ----
         results = {}
@@ -314,6 +315,7 @@ def main():
         results.update(validator.submit_test_result(args.test_execution_key, args.test_case_5_key, test5_status, test5_message))
         results.update(validator.submit_test_result(args.test_execution_key, args.test_case_6_key, test6_status, test6_message))
 
+        # ---- Add final logs to JSM ----
         validator.add_comment_adf(jsm_key, log_buffer.getvalue())
         if results:
             comment = ["📊 Test Execution Results:"]
@@ -325,6 +327,7 @@ def main():
 
         print("=" * 60)
         print(f"🏁 Validation complete for {jsm_key}")
+
 
 if __name__ == "__main__":
     main()
